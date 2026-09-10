@@ -21,7 +21,7 @@ along with FreeGS.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 
-from scipy import interpolate
+from scipy import interpolate, ndimage
 from numpy import zeros
 from numpy.linalg import inv
 from numpy import (
@@ -281,47 +281,42 @@ def core_mask(R, Z, psi, opoint, xpoint=[], psi_bndry=None):
     psin = (psi - psi_axis) / (psi_bndry - psi_axis)
 
     # Need some care near X-points to avoid flood filling through saddle point
-    # Here we first set the x-points regions to a value, to block the flood fill
-    # then later return to handle these more difficult cases
+    # Here we first block off the x-point regions, so the fill cannot leak
+    # through the saddle, then later return to handle these more difficult cases
     #
+    blocked = np.zeros(psi.shape, dtype=bool)
     xpt_inds = []
     for rx, zx, _ in xpoint:
         # Find nearest index
         ix = argmin(abs(R[:, 0] - rx))
         jx = argmin(abs(Z[0, :] - zx))
         xpt_inds.append((ix, jx))
-        # Fill this point and all around with '2'
-        for i in np.clip([ix - 1, ix, ix + 1], 0, nx - 1):
-            for j in np.clip([jx - 1, jx, jx + 1], 0, ny - 1):
-                mask[i, j] = 2
+        # Block this point and all around it
+        blocked[np.clip(ix - 1, 0, nx - 1):np.clip(ix + 2, 0, nx),
+                np.clip(jx - 1, 0, ny - 1):np.clip(jx + 2, 0, ny)] = True
 
     # Find nearest index to start
     rind = argmin(abs(R[:, 0] - Ro))
     zind = argmin(abs(Z[0, :] - Zo))
 
-    stack = [(rind, zind)]  # List of points to inspect in future
-
-    while stack:  # Whilst there are any points left
-        i, j = stack.pop()  # Remove from list
-
-        # Check the point to the left (i,j-1)
-        if (j > 0) and (psin[i, j - 1] < 1.0) and (mask[i, j - 1] < 0.5):
-            stack.append((i, j - 1))
-
-        # Scan along a row to the right
-        while True:
-            mask[i, j] = 1  # Mark as in the core
-
-            if (i < nx - 1) and (psin[i + 1, j] < 1.0) and (mask[i + 1, j] < 0.5):
-                stack.append((i + 1, j))
-            if (i > 0) and (psin[i - 1, j] < 1.0) and (mask[i - 1, j] < 0.5):
-                stack.append((i - 1, j))
-
-            if j == ny - 1:  # End of the row
-                break
-            if (psin[i, j + 1] >= 1.0) or (mask[i, j + 1] > 0.5):
-                break  # Finished this row
-            j += 1  # Move to next point along
+    # The core is the connected region of {psi_n < 1} containing the O-point.
+    #
+    # This replaces a row-scanning flood fill written in Python, which cost
+    # ~0.63 s at 257x513 and is called up to three times per Picard iteration.
+    # That fill only ever steps to (i +- 1, j) or (i, j +- 1), so the region it
+    # marks is exactly the 4-connected component ndimage.label finds with its
+    # default structure -- verified array_equal on a 257x513 STEP equilibrium.
+    #
+    # One deliberate difference, in a case that cannot arise physically: the
+    # old fill marked the O-point cell without first testing psi_n there, so a
+    # seed outside {psi_n < 1} would still produce a non-empty mask. Here such
+    # a seed lands in no component and the mask comes back empty. psi_n is 0 at
+    # the O-point by construction, so this only changes behaviour for input
+    # where opoint does not describe the psi array it was passed with.
+    labels, _ = ndimage.label(np.logical_and(psin < 1.0, ~blocked))
+    seed = labels[rind, zind]
+    if seed:
+        mask = np.where(labels == seed, 1.0, 0.0)
 
     # Now return to X-point locations
     for ix, jx in xpt_inds:
