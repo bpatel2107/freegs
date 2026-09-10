@@ -512,21 +512,62 @@ def find_safety(
     psisurf = zeros([npsi, ntheta, 2])
 
     # Calculate flux surface positions
-    for i in range(npsi):
-        psin = psirange[i]
-        for j in range(ntheta):
-            theta = theta_grid[j]
-            r, z = find_psisurface(
-                eq,
-                psifunc,
-                r0,
-                z0,
-                r0 + np.ptp(eq.R) * sin(theta),
-                z0 + np.ptp(eq.Z) * cos(theta),
-                psival=psin,
-                axis=axis,
-            )
-            psisurf[i, j, :] = [r, z]
+    #
+    # The ray searched by find_psisurface depends on theta ALONE -- psival only
+    # enters afterwards, when the crossing is located along it. Looping psi
+    # outside theta therefore re-sampled the same 100-point ray once per flux
+    # surface: at the npsi=100, ntheta=128 defaults that is 12,800 spline
+    # evaluations where 128 carry all the information, and it dominated the cost
+    # of writing a G-EQDSK (whose qpsi column comes through here). Sampling each
+    # ray once and locating every surface's crossing on it together leaves the
+    # returned q bit-identical, at ~50x less work.
+    n = 100  # find_psisurface's own sampling density along the ray
+    psirange_arr = np.asarray(psirange, dtype=float)
+    for j in range(ntheta):
+        theta = theta_grid[j]
+        r1 = r0 + np.ptp(eq.R) * sin(theta)
+        z1 = z0 + np.ptp(eq.Z) * cos(theta)
+
+        # Clip the far end into the domain, shortening the line so that the
+        # direction is unchanged -- as find_psisurface does.
+        if abs(r1 - r0) > 1e-6:
+            rclip = clip(r1, eq.Rmin, eq.Rmax)
+            z1 = z0 + (z1 - z0) * abs((rclip - r0) / (r1 - r0))
+            r1 = rclip
+        if abs(z1 - z0) > 1e-6:
+            zclip = clip(z1, eq.Zmin, eq.Zmax)
+            r1 = r0 + (r1 - r0) * abs((zclip - z0) / (z1 - z0))
+            z1 = zclip
+
+        rr = linspace(r0, r1, n)
+        zz = linspace(z0, z1, n)
+        if axis is not None:
+            axis.plot(rr, zz)
+
+        pnorm = psifunc(rr, zz, grid=False)
+
+        # First index where pnorm exceeds each psival. argmax on a boolean
+        # returns the first True, so this is the scalar argmax of the original
+        # done for every surface at once -- exact even where pnorm is not
+        # monotonic along the ray.
+        ind = argmax(pnorm[None, :] > psirange_arr[:, None], axis=1)
+
+        # ind == 0 means the surface is very close to the magnetic axis; the
+        # original declines to extrapolate there and takes the first point.
+        at_axis = ind == 0
+        ind_hi = np.clip(ind, 1, n - 1)
+        denom = pnorm[ind_hi] - pnorm[ind_hi - 1]
+        frac = np.where(denom != 0.0, (pnorm[ind_hi] - psirange_arr) / denom, 0.0)
+
+        psisurf[:, j, 0] = np.where(
+            at_axis, rr[0], (1.0 - frac) * rr[ind_hi] + frac * rr[ind_hi - 1]
+        )
+        psisurf[:, j, 1] = np.where(
+            at_axis, zz[0], (1.0 - frac) * zz[ind_hi] + frac * zz[ind_hi - 1]
+        )
+
+        if axis is not None:
+            axis.plot(psisurf[:, j, 0], psisurf[:, j, 1], "bo")
 
     # Get variables for loop integral around flux surface
     r = psisurf[:, :, 0]
